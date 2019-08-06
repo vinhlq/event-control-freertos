@@ -75,7 +75,7 @@ typedef EventBits_t FreertosEventBits_t;
 typedef uint32_t FreertosEventBits_t;
 #endif
 
-typedef uint32_t FreertosEventNumber_t;
+typedef uint16_t FreertosEventNumber_t;
 
 typedef void (*freertosEventControlCallback_t)(void *args);
 
@@ -118,13 +118,29 @@ void freertosEventControlSetActive(FreertosEventNumber_t eventToSet);
  */
 void freertosEventControlSetInactiveFromISR(FreertosEventNumber_t eventToClear);
 
-/** @brief eventControlSetInactive
+/** @brief freertosEventControlSetActiveFromISR
  *
  * This callback is called when a eventControlSetInactive.
  *
- * @param uxBitsToClear.
+ * @param eventToSet.
  */
 void freertosEventControlSetActiveFromISR(FreertosEventNumber_t eventToSet, portBASE_TYPE *pxHigherPriorityTaskWoken);
+
+/** @brief freertosEventControlSetDelayMS
+ *
+ * This callback is called when a eventControlSetInactive.
+ *
+ * @param eventToSet.
+ */
+void freertosEventControlSetDelayMS(FreertosEventNumber_t eventToSet, uint32_t timerPeriodMs);
+
+/** @brief freertosEventControlSetDelayMSFromISR
+ *
+ * This callback is called when a eventControlSetInactive.
+ *
+ * @param eventToSet.
+ */
+void freertosEventControlSetDelayMSFromISR(FreertosEventNumber_t eventToSet, uint32_t timerPeriodMs, portBASE_TYPE *pxHigherPriorityTaskWoken);
 
 /** @brief eventControlSetInactive
  *
