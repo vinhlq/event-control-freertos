@@ -62,7 +62,7 @@
 *******************************************************************************/
 
 #ifndef FREERTOS_EVENT_CONTROL_MAX_EVENT
-#define FREERTOS_EVENT_CONTROL_MAX_EVENT 16
+#define FREERTOS_EVENT_CONTROL_MAX_EVENT 17
 #endif
 
 /*******************************************************************************
@@ -81,6 +81,7 @@ typedef void (*freertosEventControlCallback_t)(void *args);
 
 typedef struct
 {
+	const char *name;
 	freertosEventControlCallback_t callback;
 	void * const args;
 }FreertosEventControl_t;
@@ -150,13 +151,35 @@ void freertosEventControlSetDelayMSFromISR(FreertosEventNumber_t eventToSet, uin
  */
 bool freertosEventControlIsActivated(FreertosEventNumber_t eventNumber);
 
+/** @brief freertosEventControlDebugEnable
+ *
+ * This enable event debug print.
+ *
+ * @param eventNumber.
+ */
+void freertosEventControlDebugEnable(FreertosEventNumber_t eventNumber);
+
 /** @brief eventControlSetInactive
  *
  * This callback is called when a eventControlSetInactive.
  *
  * @param uxBitsToClear.
  */
-void freertosEventControlInit(const configSTACK_DEPTH_TYPE usStackDepth, UBaseType_t uxPriority);
+void freertosEventControlInitDynamic(const configSTACK_DEPTH_TYPE usStackDepth, UBaseType_t uxPriority);
+
+/** @brief eventControlSetInactive
+ *
+ * This callback is called when a eventControlSetInactive.
+ *
+ * @param uxBitsToClear.
+ */
+void freertosEventControlInitStatic(UBaseType_t uxPriority);
+
+#if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+#define freertosEventControlInit freertosEventControlInitStatic
+#elif ( configSUPPORT_DYNAMIC_ALLOCATION == 1 )
+#define freertosEventControlInit freertosEventControlInitDynamic
+#endif
 
 /** @brief eventControlSetInactive
  *

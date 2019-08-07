@@ -62,50 +62,142 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/event_groups.h"
+#include "freertos/timers.h"
 
 #include "event-control.h"
 
+/*******************************************************************************
+* API Constants
+*******************************************************************************/
+
+#ifndef FREERTOS_EVENT_CONTROL_TASK_STATIC_STACK_SIZE
+#define FREERTOS_EVENT_CONTROL_TASK_STATIC_STACK_SIZE	(2048)
+#endif
+
+#ifndef FREERTOS_EVENT_CONTROL_QUEUE_SIZE
+#define FREERTOS_EVENT_CONTROL_QUEUE_SIZE	FREERTOS_EVENT_CONTROL_MAX_EVENT
+#endif
+
+#ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
+#ifndef FREERTOS_EVENT_CONTROL_TIMER_DELETE_QUEUE_SIZE
+#define FREERTOS_EVENT_CONTROL_TIMER_DELETE_QUEUE_SIZE	(8)
+#endif
+#endif
 
 /*******************************************************************************
 * Macro
 *******************************************************************************/
-
-#if ( ( configUSE_TRACE_FACILITY == 1 ) && ( INCLUDE_xTimerPendFunctionCall == 1 ) && ( configUSE_TIMERS == 1 ) )
-#define FREERTOS_EVENT_CONTROL_USE_EVENT_GROUP
-#endif
-
 #define FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
 
-#ifndef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
-#define debugPrintln(fmt,args...)	printf(fmt "%s", ## args, "\r\n")
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+#define debugPrintln(fmt,args...)	\
+	printf(fmt "%s", ## args, "\r\n");
+
+#define evtDebugPrintln(eventNumber, fmt,args...)	\
+	do {	\
+		if(eventNumber == FREERTOS_EVENT_CONTROL_MAX_EVENT || eventControlFlags[eventNumber] & FREERTOS_EVENT_CONTROL_FLAG_DEBUG_ENABLED)	{	\
+			debugPrintln(fmt, ## args);	\
+		}	\
+	}while(0)
 #else
 #define debugPrintln(...)
+#define evtDebugPrintln(eventNumber, fmt,args...)
 #endif
+
+#define FREERTOS_EVENT_CONTROL_BLOCKING_MAXIMUM	(100)
 
 typedef struct
 {
 	FreertosEventNumber_t eventNumber;
 	uint16_t delayPeriodMs;
-}EventQueueParameter_t;
+}EventQueueItem_t;
+
+static xTaskHandle eventControlTaskHandle = NULL;
+#if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+static StaticTask_t eventControlTaskBuffer;
+static StackType_t eventControlTaskStack[ FREERTOS_EVENT_CONTROL_TASK_STATIC_STACK_SIZE ];
+
+/* The variable used to hold the queue's data structure. */
+static StaticQueue_t eventControlQueue;
+
+/* The array to use as the queue's storage area.  This must be at least
+uxQueueLength * uxItemSize bytes. */
+static uint8_t eventControlQueueStorageArea[ FREERTOS_EVENT_CONTROL_QUEUE_SIZE * sizeof(EventQueueItem_t) ];
 
 #ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
-	static xTimerHandle timerdeleteQueue;
+/* The variable used to hold the queue's data structure. */
+static StaticQueue_t timerDeleteQueue;
+
+/* The array to use as the queue's storage area.  This must be at least
+uxQueueLength * uxItemSize bytes. */
+static uint8_t timerDeleteQueueStorageArea[ FREERTOS_EVENT_CONTROL_TIMER_DELETE_QUEUE_SIZE * sizeof(xTimerHandle) ];
+#endif
+#endif // #if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+
+#ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
+static xTimerHandle timerDeleteQueueHandle;
 #endif
 
-#if FREERTOS_EVENT_CONTROL_USE_EVENT_GROUP
-static EventGroupHandle_t eventControlEventGroup[(FREERTOS_EVENT_CONTROL_MAX_EVENT/sizeof(EventBits_t)) + 1]={NULL};
-#else
-static xQueueHandle eventControlQueue=NULL;
-#endif
-static FreertosEventControl_t *eventControls[FREERTOS_EVENT_CONTROL_MAX_EVENT];
-static FreertosEventBits_t eventControlEventBits[(FREERTOS_EVENT_CONTROL_MAX_EVENT/sizeof(FreertosEventBits_t)) + 1];
+static xQueueHandle eventControlQueueHandle=NULL;
+static const FreertosEventControl_t *eventControls[FREERTOS_EVENT_CONTROL_MAX_EVENT];
+#define FREERTOS_EVENT_CONTROL_NUMBER_OF_REGISTER	((FREERTOS_EVENT_CONTROL_MAX_EVENT/sizeof(FreertosEventBits_t)) + ((FREERTOS_EVENT_CONTROL_MAX_EVENT%sizeof(FreertosEventBits_t)) == 0 ? 0:1))
+static FreertosEventBits_t eventControlEventBits[FREERTOS_EVENT_CONTROL_NUMBER_OF_REGISTER * 2];
 
-#define eventControlEventGetEventGroup(eventNumber)		eventControlEventGroup[eventNumber/sizeof(EventBits_t)]
-#define eventControlEventGetEventGroupBit(eventNumber)	(eventNumber%sizeof(EventBits_t))
-#define eventControlEventBitsClear(eventNumber)		eventControlEventBits[eventNumber/sizeof(FreertosEventBits_t)] &= ~(1<<(eventNumber%sizeof(FreertosEventBits_t)))
-#define eventControlEventBitsSet(eventNumber)		eventControlEventBits[eventNumber/sizeof(FreertosEventBits_t)] |= (1<<(eventNumber%sizeof(FreertosEventBits_t)))
-#define eventControlEventNumberIsSet(eventNumber)	(eventControlEventBits[eventNumber/sizeof(FreertosEventBits_t)] & (1<<(eventNumber%sizeof(FreertosEventBits_t))))
+#define setRegister(eventNumber)	(eventNumber/sizeof(FreertosEventBits_t))
+#define activeRegister(eventNumber)	(FREERTOS_EVENT_CONTROL_NUMBER_OF_REGISTER + setRegister(eventNumber))
+
+#define FREERTOS_EVENT_CONTROL_FLAG_DEBUG_ENABLED	(1<<0)
+static uint8_t eventControlFlags[FREERTOS_EVENT_CONTROL_MAX_EVENT];
+
+
+#define eventControlEventBitsClear(eventNumber)	\
+		eventControlEventBits[setRegister(eventNumber)] &= ~(1<<(eventNumber%sizeof(FreertosEventBits_t)));	\
+
+#define eventControlEventBitsDeactivate(eventNumber)	\
+		eventControlEventBits[activeRegister(eventNumber)] &= ~(1<<(eventNumber%sizeof(FreertosEventBits_t)));	\
+
+#define eventControlEventBitsDeactivateAndClear(eventNumber)	\
+	do {	\
+		eventControlEventBitsClear(eventNumber);	\
+		eventControlEventBitsDeactivate(eventNumber);	\
+	}while(0)
+
+#define eventControlEventBitsSet(eventNumber)	\
+		eventControlEventBits[setRegister(eventNumber)] |= (1<<(eventNumber%sizeof(FreertosEventBits_t)));
+
+#define eventControlEventBitsActive(eventNumber)	\
+		eventControlEventBits[activeRegister(eventNumber)] |= (1<<(eventNumber%sizeof(FreertosEventBits_t)));
+
+#define eventControlEventBitsSetAndActive(eventNumber)	\
+	do {	\
+		eventControlEventBitsSet(eventNumber);	\
+		eventControlEventBitsActive(eventNumber);	\
+	}while(0)
+
+#define eventControlEventBitsClearAndActive(eventNumber)	\
+	do {	\
+		eventControlEventBitsClear(eventNumber);	\
+		eventControlEventBitsActive(eventNumber);	\
+	}while(0)
+
+#define eventControlEventNumberIsSet(eventNumber)	\
+		(eventControlEventBits[setRegister(eventNumber)] & (1<<(eventNumber%sizeof(FreertosEventBits_t))))
+
+#define eventControlEventNumberIsActivated(eventNumber)	\
+		(eventControlEventBits[activeRegister(eventNumber)] & (1<<(eventNumber%sizeof(FreertosEventBits_t))))
+
+#define eventControlEventNumberIsSetAndActivated(eventNumber)	\
+		(eventControlEventNumberIsSet(eventNumber) && eventControlEventNumberIsActivated(eventNumber))
+
+#define eventControlGetEventName(eventNumber)	\
+		(eventNumber < FREERTOS_EVENT_CONTROL_MAX_EVENT && eventControls[eventNumber] && eventControls[eventNumber]->name && eventControls[eventNumber]->name[0] ? eventControls[eventNumber]->name:"unknown")
+
+
+/*******************************************************************************
+*   Function Code
+*******************************************************************************/
+
+static void freertosQueueFullHander(void);
 
 void freertosEventControlSetInactive(FreertosEventNumber_t eventToClear)
 {
@@ -114,25 +206,41 @@ void freertosEventControlSetInactive(FreertosEventNumber_t eventToClear)
 		return;
 	}
 	taskENTER_CRITICAL();
-	eventControlEventBitsClear(eventToClear);
+	eventControlEventBitsDeactivateAndClear(eventToClear);
 	taskEXIT_CRITICAL();
+}
+
+static inline void freertosEventControlSetReActive(FreertosEventNumber_t eventToSet)
+{
+	EventQueueItem_t eventQueueItem;
+	portBASE_TYPE xReturn;
+
+	while(!uxQueueSpacesAvailable(eventControlQueueHandle))
+	{
+		freertosQueueFullHander();
+	}
+
+	eventQueueItem.delayPeriodMs = 0;
+	eventQueueItem.eventNumber = eventToSet;
+	xReturn = xQueueSend(eventControlQueueHandle, (void *)&eventQueueItem, 0);
+	evtDebugPrintln(	eventToSet,
+						"Event control set active: event[%u]: %s, result: %s: %u",
+						eventToSet, eventControlGetEventName(eventToSet),
+						xReturn == pdPASS ? "pass":"fail", (uint32_t)xReturn);
 }
 
 void freertosEventControlSetActive(FreertosEventNumber_t eventToSet)
 {
-	EventQueueParameter_t eventQueueParameter;
+
 
 	if(eventToSet >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
 	{
 		return;
 	}
 	taskENTER_CRITICAL();
-	eventControlEventBitsSet(eventToSet);
+	eventControlEventBitsSetAndActive(eventToSet);
 	taskEXIT_CRITICAL();
-
-	eventQueueParameter.delayPeriodMs = 0;
-	eventQueueParameter.eventNumber = eventToSet;
-	xQueueSend(eventControlQueue, (void *)&eventQueueParameter, portMAX_DELAY);
+	freertosEventControlSetReActive(eventToSet);
 }
 
 void freertosEventControlSetInactiveFromISR(FreertosEventNumber_t eventToClear)
@@ -145,14 +253,14 @@ void freertosEventControlSetInactiveFromISR(FreertosEventNumber_t eventToClear)
 	}
 
 	uxSavedInterruptStatus = taskENTER_CRITICAL_FROM_ISR();
-	eventControlEventBitsClear(eventToClear);
+	eventControlEventBitsDeactivateAndClear(eventToClear);
 	taskEXIT_CRITICAL_FROM_ISR( uxSavedInterruptStatus );
 }
 
 void freertosEventControlSetActiveFromISR(FreertosEventNumber_t eventToSet, portBASE_TYPE *pxHigherPriorityTaskWoken)
 {
 	UBaseType_t uxSavedInterruptStatus;
-	EventQueueParameter_t eventQueueParameter;
+	EventQueueItem_t eventQueueItem;
 
 	if(eventToSet >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
 	{
@@ -160,12 +268,12 @@ void freertosEventControlSetActiveFromISR(FreertosEventNumber_t eventToSet, port
 	}
 
 	uxSavedInterruptStatus = taskENTER_CRITICAL_FROM_ISR();
-	eventControlEventBitsSet(eventToSet);
+	eventControlEventBitsSetAndActive(eventToSet);
 	taskEXIT_CRITICAL_FROM_ISR( uxSavedInterruptStatus );
 
-	eventQueueParameter.delayPeriodMs = 0;
-	eventQueueParameter.eventNumber = eventToSet;
-	xQueueSendFromISR(eventControlQueue, (void *)&eventQueueParameter, pxHigherPriorityTaskWoken);
+	eventQueueItem.delayPeriodMs = 0;
+	eventQueueItem.eventNumber = eventToSet;
+	xQueueSendFromISR(eventControlQueueHandle, (void *)&eventQueueItem, pxHigherPriorityTaskWoken);
 }
 
 bool freertosEventControlIsActivated(FreertosEventNumber_t eventNumber)
@@ -174,39 +282,61 @@ bool freertosEventControlIsActivated(FreertosEventNumber_t eventNumber)
 	{
 		return false;
 	}
-	return eventControlEventNumberIsSet(eventNumber);
+	return eventControlEventNumberIsSetAndActivated(eventNumber);
 }
 
 static void vTimerSetEventCallback( xTimerHandle xTimer )
 {
-	EventQueueParameter_t eventQueueParameter;
+	FreertosEventNumber_t eventNumber;
 	portBASE_TYPE xReturn;
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+	const char *eventName;
+#endif
 
 	/* Optionally do something if the pxTimer parameter is NULL. */
 	configASSERT( xTimer );
 
 	/* event is saved as the
 	timer's ID */
-	eventQueueParameter.eventNumber = ( FreertosEventNumber_t ) ((uint32_t)pvTimerGetTimerID( xTimer ));
-	eventQueueParameter.delayPeriodMs = 0;
+	eventNumber = ( FreertosEventNumber_t ) ((uint32_t)pvTimerGetTimerID( xTimer ));
+
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+	eventName = eventControlGetEventName(eventNumber);
+#endif
 
 	/* delete */
 #ifdef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
 	xReturn = xTimerDelete(xTimer, portMAX_DELAY);
-	debugPrintln("Event control timer delete: %s: %u", xReturn == pdPASS ? "pass":"fail", (uint32_t)xReturn);
+	evtDebugPrintln(	eventNumber,
+						"Event control delete timer: event[%u]: %s, result: %s: %u",
+						eventNumber, eventName,
+						xReturn == pdPASS ? "pass":"fail", (uint32_t)xReturn);
+
+	// pdFAIL == FATAL
 	configASSERT(xReturn == pdPASS);
 #else
-	xReturn = xQueueSend(timerdeleteQueue, (void *)&xTimer, 0);
-	debugPrintln("Event control timer queue for delete: %s: %u", xReturn == pdPASS ? "pass":"fail", (uint32_t)xReturn);
+	xReturn = xQueueSend(timerDeleteQueueHandle, (void *)&xTimer, 0);
+	evtDebugPrintln(	eventNumber,
+						"Event control timer enqueue for delete: event[%u]: %s, result: %s: %u",
+						eventNumber, eventName,
+						xReturn == pdPASS ? "pass":"fail", (uint32_t)xReturn);
+
+	// pdFAIL == FATAL
 	configASSERT(xReturn == pdPASS);
 #endif
 
-	freertosEventControlSetActive( eventQueueParameter.eventNumber );
+	if(eventControlEventNumberIsActivated(eventNumber))
+	{
+		taskENTER_CRITICAL();
+		eventControlEventBitsSet(eventNumber);
+		taskEXIT_CRITICAL();
+		freertosEventControlSetReActive( eventNumber );
+	}
 }
 
 void freertosEventControlSetDelayMS(FreertosEventNumber_t eventToSet, uint32_t timerPeriodMs)
 {
-	EventQueueParameter_t eventQueueParameter;
+	EventQueueItem_t eventQueueItem;
 
 	if(eventToSet >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
 	{
@@ -214,16 +344,16 @@ void freertosEventControlSetDelayMS(FreertosEventNumber_t eventToSet, uint32_t t
 	}
 
 	taskENTER_CRITICAL();
-	eventControlEventBitsClear(eventToSet);
+	eventControlEventBitsClearAndActive(eventToSet);
 	taskEXIT_CRITICAL();
-	eventQueueParameter.eventNumber = eventToSet;
-	eventQueueParameter.delayPeriodMs = timerPeriodMs < 65535 ? timerPeriodMs:65535;
-	xQueueSend(eventControlQueue, (void *)&eventQueueParameter, portMAX_DELAY);
+	eventQueueItem.eventNumber = eventToSet;
+	eventQueueItem.delayPeriodMs = timerPeriodMs < 65535 ? timerPeriodMs:65535;
+	xQueueSend(eventControlQueueHandle, (void *)&eventQueueItem, 0);
 }
 
 void freertosEventControlSetDelayMSFromISR(FreertosEventNumber_t eventToSet, uint32_t timerPeriodMs, portBASE_TYPE *pxHigherPriorityTaskWoken)
 {
-	EventQueueParameter_t eventQueueParameter;
+	EventQueueItem_t eventQueueItem;
 	UBaseType_t uxSavedInterruptStatus;
 
 	if(eventToSet >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
@@ -232,86 +362,228 @@ void freertosEventControlSetDelayMSFromISR(FreertosEventNumber_t eventToSet, uin
 	}
 
 	uxSavedInterruptStatus = taskENTER_CRITICAL_FROM_ISR();
-	eventControlEventBitsClear(eventToSet);
+	eventControlEventBitsClearAndActive(eventToSet);
 	taskEXIT_CRITICAL_FROM_ISR( uxSavedInterruptStatus );
-	eventQueueParameter.eventNumber = eventToSet;
-	eventQueueParameter.delayPeriodMs = timerPeriodMs < 65535 ? timerPeriodMs:65535;
-	xQueueSendFromISR(eventControlQueue, (void *)&eventQueueParameter, pxHigherPriorityTaskWoken);
+	eventQueueItem.eventNumber = eventToSet;
+	eventQueueItem.delayPeriodMs = timerPeriodMs < 65535 ? timerPeriodMs:65535;
+	xQueueSendFromISR(eventControlQueueHandle, (void *)&eventQueueItem, pxHigherPriorityTaskWoken);
+}
+
+static void freertosQueueEventHander(EventQueueItem_t *item)
+{
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+	const char *eventName;
+#endif
+
+	if( item->eventNumber >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
+	{
+		evtDebugPrintln(item->eventNumber, "Invalid event number: %u", item->eventNumber);
+		return;
+	}
+
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+	eventName = eventControlGetEventName(item->eventNumber);
+#endif
+
+	if(item->delayPeriodMs > 0 && eventControlEventNumberIsActivated(item->eventNumber))
+	{
+		xTimerHandle eventControlDelayTimer = xTimerCreate(	"event-control-delay",
+															item->delayPeriodMs/portTICK_RATE_MS,
+															pdFALSE,
+															(void *)((uint32_t)item->eventNumber),
+															vTimerSetEventCallback );
+		evtDebugPrintln(	item->eventNumber,
+							"Event control set delay: %u, event[%u]: %s, result: %s",
+							 item->delayPeriodMs, item->eventNumber, eventName,
+							 eventControlDelayTimer == NULL ? "fail":"ok");
+
+		// NULL == FATAL
+		configASSERT(eventControlDelayTimer);
+		if(eventControlDelayTimer)
+		{
+			portBASE_TYPE xReturn;
+
+			xReturn = xTimerStart(eventControlDelayTimer, FREERTOS_EVENT_CONTROL_BLOCKING_MAXIMUM);
+			evtDebugPrintln(	item->eventNumber,
+								"Event control start delay timer: event[%u]: %s, result: %s",
+								item->eventNumber, eventName,
+								xReturn == pdPASS ? "pass":"fail");
+			// pdFAIL == FATAL
+			configASSERT(xReturn == pdPASS);
+		}
+		return;
+	}
+
+
+	if(eventControls[item->eventNumber])
+	{
+		evtDebugPrintln(	item->eventNumber,
+						"Event control handle: event[%u]: %s",
+						item->eventNumber, eventName);
+		eventControls[item->eventNumber]->callback(eventControls[item->eventNumber]->args);
+	}
+
+	// re-queue un-clear event
+	if(eventControlEventNumberIsSetAndActivated(item->eventNumber))
+	{
+		portBASE_TYPE xReturn;
+		EventQueueItem_t eventQueueItem;
+
+		eventQueueItem.delayPeriodMs = 0;
+		eventQueueItem.eventNumber = item->eventNumber;
+
+		while(!uxQueueSpacesAvailable(eventControlQueueHandle))
+		{
+			freertosQueueFullHander();
+		}
+		xReturn = xQueueSend(eventControlQueueHandle, (void *)&eventQueueItem, FREERTOS_EVENT_CONTROL_BLOCKING_MAXIMUM);
+
+		evtDebugPrintln(	item->eventNumber,
+						"Event control re-queue: event[%u]: %s, result: %s",
+						item->eventNumber, eventName,
+						xReturn == pdPASS ? "pass":"fail");
+	}
+}
+
+static void freertosQueueFullHander(void)
+{
+	EventQueueItem_t eventQueueItem;
+	extern void *pxCurrentTCB;
+
+	// not current task == FATAL
+	taskENTER_CRITICAL();
+	configASSERT(eventControlTaskHandle == pxCurrentTCB);
+	taskEXIT_CRITICAL();
+
+	if (!xQueueReceive(eventControlQueueHandle, &eventQueueItem, portMAX_DELAY))
+	{
+		return;
+	}
+	freertosQueueEventHander(&eventQueueItem);
 }
 
 static void freertosEventControlTask(void *param)
 {
+	extern void *pxCurrentTCB;
+
+	configASSERT(eventControlTaskHandle == pxCurrentTCB);
 	while(1)
 	{
-		EventQueueParameter_t eventQueueParameter;
+		EventQueueItem_t eventQueueItem;
 
 #ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
 		xTimerHandle eventControlTimer;
-		if (xQueueReceive(timerdeleteQueue, &eventControlTimer, 0))
+		if (xQueueReceive(timerDeleteQueueHandle, &eventControlTimer, 0))
 		{
 			xTimerDelete(capsenseTimer, portMAX_DELAY);
 		}
 #endif
 
-		if (!xQueueReceive(eventControlQueue, &eventQueueParameter, portMAX_DELAY))
+		if (!xQueueReceive(eventControlQueueHandle, &eventQueueItem, portMAX_DELAY))
 		{
 			continue;
 		}
 
-		if(eventQueueParameter.delayPeriodMs > 0)
-		{
-			xTimerHandle eventControlDelayTimer = xTimerCreate(	"event-control-delay",
-																eventQueueParameter.delayPeriodMs/portTICK_RATE_MS,
-																pdFALSE,
-																(void *)((uint32_t)eventQueueParameter.eventNumber),
-																vTimerSetEventCallback );
-			xTimerStart(eventControlDelayTimer, portMAX_DELAY);
-			debugPrintln("Event control: set delay: %u, eventNumber: 0x%x", eventQueueParameter.delayPeriodMs, eventQueueParameter.eventNumber);
-			continue;
-		}
-
-		if( eventQueueParameter.eventNumber >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
-		{
-			debugPrintln("Invalid event number: %u", eventQueueParameter.eventNumber);
-			continue;
-		}
-
-		if(eventControlEventNumberIsSet(eventQueueParameter.eventNumber))
-		{
-			eventQueueParameter.delayPeriodMs = 0;
-			xQueueSend(eventControlQueue, (void *)&eventQueueParameter, 10);
-		}
-
-
-		if(eventControls[eventQueueParameter.eventNumber])
-		{
-			eventControls[eventQueueParameter.eventNumber]->callback(eventControls[eventQueueParameter.eventNumber]->args);
-		}
+		freertosQueueEventHander(&eventQueueItem);
 	}
 }
 
-void freertosEventControlInit(const configSTACK_DEPTH_TYPE usStackDepth, UBaseType_t uxPriority)
+static inline void freertosEventControlEventBitsInit(void)
 {
 	uint8_t i;
-
-	eventControlQueue = xQueueCreate(FREERTOS_EVENT_CONTROL_MAX_EVENT, sizeof(EventQueueParameter_t));
-	configASSERT( eventControlQueue );
-
-#ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
-	timerdeleteQueue = xQueueCreate(8, sizeof(xTimerHandle));
-#endif
 
 	for(i = 0; i < FREERTOS_EVENT_CONTROL_MAX_EVENT; i++)
 	{
 		eventControls[i] = NULL;
+		eventControlFlags[i] = 0;
 	}
-	for(i = 0; i < ((FREERTOS_EVENT_CONTROL_MAX_EVENT/sizeof(FreertosEventBits_t)) + 1); i++)
+	for(i = 0; i < sizeof(eventControlEventBits)/sizeof(FreertosEventBits_t); i++)
 	{
 		eventControlEventBits[i] = 0;
 	}
-
-	xTaskCreate(freertosEventControlTask, "event control task", usStackDepth, NULL, uxPriority, NULL);
+	debugPrintln(	"Event control: maximum of event: %u, register count: %u",
+					FREERTOS_EVENT_CONTROL_MAX_EVENT,
+					sizeof(eventControlEventBits)/sizeof(FreertosEventBits_t));
+	configASSERT((FREERTOS_EVENT_CONTROL_NUMBER_OF_REGISTER * 2) == sizeof(eventControlEventBits)/sizeof(FreertosEventBits_t));
 }
+
+#if ( configSUPPORT_STATIC_ALLOCATION == 1 )
+void freertosEventControlInitStatic(UBaseType_t uxPriority)
+{
+	freertosEventControlEventBitsInit();
+
+	/* Create a queue capable of containing 10 uint64_t values. */
+	eventControlQueueHandle = xQueueCreateStatic(
+									FREERTOS_EVENT_CONTROL_QUEUE_SIZE,
+									sizeof(EventQueueItem_t),
+									eventControlQueueStorageArea,
+									&eventControlQueue );
+
+	/* pxQueueBuffer was not NULL so xQueue should not be NULL. */
+	configASSERT( eventControlQueueHandle );
+
+#ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
+	/* Create a queue capable of containing 10 uint64_t values. */
+	timerDeleteQueueHandle = xQueueCreateStatic(
+									FREERTOS_EVENT_CONTROL_TIMER_DELETE_QUEUE_SIZE,
+									sizeof(EventQueueItem_t),
+									timerDeleteQueueStorageArea,
+									&timerDeleteQueue );
+
+	/* pxQueueBuffer was not NULL so xQueue should not be NULL. */
+	configASSERT( eventControlQueueHandle );
+#endif
+
+	eventControlTaskHandle = xTaskCreateStatic(
+					freertosEventControlTask,
+					"event control task static",
+					FREERTOS_EVENT_CONTROL_TASK_STATIC_STACK_SIZE,
+					NULL,
+					uxPriority,
+					eventControlTaskStack,
+					&eventControlTaskBuffer);
+	// NULL == FATAL
+	configASSERT(eventControlTaskHandle);
+}
+#endif
+
+#if( configSUPPORT_DYNAMIC_ALLOCATION == 1 )
+void freertosEventControlInitDynamic(const configSTACK_DEPTH_TYPE usStackDepth, UBaseType_t uxPriority)
+{
+	portBASE_TYPE xReturn;
+
+	freertosEventControlEventBitsInit();
+
+	eventControlQueueHandle = xQueueCreate(FREERTOS_EVENT_CONTROL_QUEUE_SIZE, sizeof(EventQueueItem_t));
+	configASSERT( eventControlQueueHandle );
+
+#ifndef FREERTOS_EVENT_CONTROL_TIMER_SELF_DELETE
+	timerDeleteQueueHandle = xQueueCreate(FREERTOS_EVENT_CONTROL_TIMER_DELETE_QUEUE_SIZE, sizeof(xTimerHandle));
+	configASSERT( timerDeleteQueueHandle );
+#endif
+
+	xReturn = xTaskCreate(
+					freertosEventControlTask,
+					"event control task dynamic",
+					usStackDepth,
+					NULL,
+					uxPriority,
+					&eventControlTaskHandle);
+	// pdFAIL == FATAL
+	configASSERT(xReturn == pdPASS);
+}
+#endif
+
+#ifdef FREERTOS_EVENT_CONTROL_DEBUG_ENABLED
+void freertosEventControlDebugEnable(FreertosEventNumber_t eventNumber)
+{
+	if(eventNumber >= FREERTOS_EVENT_CONTROL_MAX_EVENT)
+	{
+		return;
+	}
+	eventControlFlags[eventNumber] |= FREERTOS_EVENT_CONTROL_FLAG_DEBUG_ENABLED;
+}
+#endif
 
 uint16_t freertosEventControlRegister(const FreertosEventControl_t *eventControl)
 {
@@ -319,7 +591,7 @@ uint16_t freertosEventControlRegister(const FreertosEventControl_t *eventControl
 
 	for(i = 0; i < FREERTOS_EVENT_CONTROL_MAX_EVENT; i++)
 	{
-		if(!eventControlEventNumberIsSet(i))
+		if(!eventControls[i])
 		{
 			eventControls[i] = eventControl;
 			break;
