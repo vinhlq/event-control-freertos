@@ -69,11 +69,7 @@
 * Data Type Definitions
 *******************************************************************************/
 
-#if ( ( configUSE_TRACE_FACILITY == 1 ) && ( INCLUDE_xTimerPendFunctionCall == 1 ) && ( configUSE_TIMERS == 1 ) )
-typedef EventBits_t FreertosEventBits_t;
-#else
 typedef uint32_t FreertosEventBits_t;
-#endif
 
 typedef uint16_t FreertosEventNumber_t;
 
